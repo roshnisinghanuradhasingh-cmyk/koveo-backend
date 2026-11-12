@@ -799,7 +799,11 @@ io.on('connection', (socket) => {
 
         const isPeerTrulyConnected = receiverSockets.length > 0;
         if (typeof callback === 'function') {
-            callback({ queued: true, peerOnline: isPeerTrulyConnected });
+            callback({ 
+                queued: true, 
+                peerOnline: isPeerTrulyConnected,
+                receiverOffline: !isPeerTrulyConnected // 🚀 Frontend trigger for SMS Pill!
+            });
         }
 
         // 3. Emit to ALL active devices of the receiver
@@ -820,9 +824,44 @@ io.on('connection', (socket) => {
                     },
                     data: { type: 'WAKE_UP_SYNC', senderPhone: String(senderNorm || '') },
                     android: { priority: 'high' }
-                }).catch(() => {});
+                }).catch((err) => {
+                    // 🛡️ FIX: Remove stale FCM tokens to prevent Firebase from banning/throttling your project!
+                    if (err.code === 'messaging/registration-token-not-registered' || err.code === 'messaging/invalid-registration-token') {
+                        const u = registeredUsers.get(matchedPhone);
+                        if (u) {
+                            u.fcmToken = null;
+                            registeredUsers.set(matchedPhone, u);
+                            savePersistentUsers();
+                            console.log(`🗑️ Removed stale FCM token for ${matchedPhone}`);
+                        }
+                    }
+                });
             }
         }
+    });
+
+    // 🔄 SYNC OLD DOUBLE TICKS ON BOOT (RAM Queue Check)
+    socket.on('check_message_statuses', (msgIds, callback) => {
+        if (!Array.isArray(msgIds) || typeof callback !== 'function') return;
+        const statuses = [];
+        
+        msgIds.forEach(id => {
+            let isStillPending = false;
+            // Scan RAM queue: If message is NO LONGER in the receiver's queue, it was successfully delivered!
+            if (global.encryptedRamQueue) {
+                for (const queue of global.encryptedRamQueue.values()) {
+                    if (queue.some(m => m.id === id)) {
+                        isStillPending = true;
+                        break;
+                    }
+                }
+            }
+            if (!isStillPending) {
+                statuses.push({ id, status: 'delivered' });
+            }
+        });
+        
+        callback(statuses);
     });
 
     // ✔️✔️ MULTI-DEVICE BULLETPROOF DELIVERY RECEIPT RELAY (Never deletes until ALL linked devices receive it!)
@@ -913,10 +952,23 @@ io.on('connection', (socket) => {
         console.log(`🚩 Safety Report from ${socket.userPhone} against ${data?.targetId}: ${data?.reason}`);
     });
 
-    // 🔴 MULTI-DEVICE DISCONNECT LOGIC (Only marks user offline when ALL linked devices disconnect!)
+    // 🔴 MULTI-DEVICE DISCONNECT LOGIC & GHOST CALL CANCELLATION
     socket.on('disconnect', () => {
         const userId = socket.userPhone;
         if (!userId) return;
+
+        // 📞 FIX: Prevent "Ghost Ringing" - If the caller's internet drops, cancel their outgoing calls instantly!
+        const myNorm = normalizeServerPhone(userId);
+        if (global.pendingCalls) {
+            global.pendingCalls.forEach((callData, receiverPhone) => {
+                if (callData.from === myNorm) {
+                    global.pendingCalls.delete(receiverPhone);
+                    if (global.pendingCallCandidates) global.pendingCallCandidates.delete(receiverPhone);
+                    const { sockIds: recSockets } = getAllSocketsForPhone(receiverPhone);
+                    recSockets.forEach(sId => io.to(sId).emit('call_ended', { reason: 'Caller disconnected' }));
+                }
+            });
+        }
 
         const devMap = userDevicesMap.get(userId);
         if (devMap && socket.deviceId) {
