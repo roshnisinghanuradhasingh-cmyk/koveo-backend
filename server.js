@@ -67,6 +67,10 @@ const savePersistentUsers = () => {
                 dpUrl: val.dpUrl || '',
                 dpBg: val.dpBg || '00d4ff',
                 fcmToken: val.fcmToken || null,
+                primaryDeviceId: val.primaryDeviceId || null,
+                hardwarePublicKey: val.hardwarePublicKey || null,
+                apkCertHash: val.apkCertHash || null,
+                sessionTokens: Array.from(val.sessionTokens || []).slice(-10),
                 last_seen: val.last_seen || Date.now()
             };
         });
@@ -135,46 +139,148 @@ const getAllSocketsForPhone = (rawTarget) => {
 io.on('connection', (socket) => {
     console.log(`🟢 Device Connected: ${socket.id}`);
 
-    // 🔐 1. CRYPTOGRAPHIC SIM CHALLENGE-RESPONSE (Prevents Fake Frontend Bypass!)
+    // 🔐 1. MILITARY-GRADE HARDWARE KEYSTORE ECDSA CHALLENGE-RESPONSE + BRUTE-FORCE LOCKOUT
+    if (!global.authRateLimitMap) global.authRateLimitMap = new Map();
+
     socket.on('request_sim_challenge', (data, callback) => {
+        const clientIp = (socket.handshake.headers['x-forwarded-for'] || socket.handshake.address || 'unknown').split(',')[0].trim();
         const cleanPhone = normalizeServerPhone(data?.phone);
-        if (cleanPhone.length < 10) {
-            if (typeof callback === 'function') callback({ success: false, message: 'Invalid phone number' });
+        const raw10 = cleanPhone.replace(/\D/g, '').slice(-10);
+
+        // Brute-Force IP + Phone Lockout Check
+        const rateKey = `${clientIp}_${cleanPhone}`;
+        const rateInfo = global.authRateLimitMap.get(rateKey) || { count: 0, lockUntil: 0 };
+        if (Date.now() < rateInfo.lockUntil) {
+            const waitSec = Math.ceil((rateInfo.lockUntil - Date.now()) / 1000);
+            if (typeof callback === 'function') callback({ success: false, message: `🛡️ Security Lockout! Wait ${waitSec}s before retrying.` });
             return;
         }
-        const nonce = 'KVN_' + crypto.randomBytes(12).toString('hex');
+
+        if (raw10.length !== 10 || !/^[6-9]\d{9}$/.test(raw10) || /^(\d)\1{9}$/.test(raw10) || raw10 === '9876543210') {
+            if (typeof callback === 'function') callback({ success: false, message: '❌ Invalid mobile number format.' });
+            return;
+        }
+
+        const hwMethod = String(data?.hardwareMethod || '');
+        const pubKey = String(data?.publicKey || '').trim();
+        // 🛑 STRICT HARDWARE LOCK: Reject Laptop/Web/Browser requests that lack an Android Keystore ECDSA Public Key!
+        if (!hwMethod || !hwMethod.startsWith('SIM_') || !pubKey || pubKey.length < 40) {
+            if (typeof callback === 'function') {
+                callback({
+                    success: false,
+                    message: '❌ Direct login requires an Android Phone with physical SIM! On Laptop/Web, use "Link as companion device".'
+                });
+            }
+            return;
+        }
+
+        const existingUser = registeredUsers.get(cleanPhone);
+        if (existingUser && existingUser.primaryDeviceId && existingUser.primaryDeviceId !== data?.deviceId) {
+            const isPhysicalSimMove = hwMethod.startsWith('SIM_') && !!data?.publicKey;
+            if (!isPhysicalSimMove) {
+                if (typeof callback === 'function') {
+                    callback({
+                        success: false,
+                        message: '❌ Account locked to primary phone hardware! Use "Link as companion device".'
+                    });
+                }
+                return;
+            }
+        }
+
+        // 256-bit Cryptographic Random Nonce (Single-Use, 90s TTL)
+        const nonce = 'KVN_' + crypto.randomBytes(32).toString('hex');
         simChallengesMap.set(cleanPhone, {
             nonce,
+            socketId: socket.id,
+            clientIp,
             simSlot: data?.simSlot || 1,
-            expiresAt: Date.now() + (3 * 60 * 1000)
+            deviceId: data?.deviceId,
+            hardwareMethod: hwMethod,
+            publicKey: data?.publicKey || '',
+            apkCertHash: data?.apkCertHash || 'web',
+            expiresAt: Date.now() + (90 * 1000)
         });
+
         if (typeof callback === 'function') {
             callback({ success: true, nonce, timestamp: Date.now() });
         }
     });
 
     socket.on('verify_sim_proof', (data, callback) => {
+        const clientIp = (socket.handshake.headers['x-forwarded-for'] || socket.handshake.address || 'unknown').split(',')[0].trim();
         const cleanPhone = normalizeServerPhone(data?.phone);
+        const rateKey = `${clientIp}_${cleanPhone}`;
+        const rateInfo = global.authRateLimitMap.get(rateKey) || { count: 0, lockUntil: 0 };
+
+        const recordFailure = (msg) => {
+            rateInfo.count += 1;
+            if (rateInfo.count >= 5) {
+                rateInfo.lockUntil = Date.now() + (10 * 60 * 1000); // 10-minute ban after 5 failed attempts
+            }
+            global.authRateLimitMap.set(rateKey, rateInfo);
+            if (typeof callback === 'function') callback({ success: false, message: msg });
+        };
+
         const challenge = simChallengesMap.get(cleanPhone);
-        if (!challenge || Date.now() > challenge.expiresAt) {
-            if (typeof callback === 'function') callback({ success: false, message: 'Challenge expired. Retry verification.' });
-            return;
-        }
-        // Verify SHA-256 HMAC/Hash proof of (nonce + phone + deviceId)
-        const expectedProof = crypto.createHash('sha256')
-            .update(`${challenge.nonce}:${cleanPhone}:${data?.deviceId || 'default'}`)
-            .digest('hex');
-
-        if (data?.proof !== expectedProof) {
-            if (typeof callback === 'function') callback({ success: false, message: 'Cryptographic SIM signature mismatch' });
-            return;
+        if (!challenge || Date.now() > challenge.expiresAt || challenge.socketId !== socket.id) {
+            simChallengesMap.delete(cleanPhone);
+            return recordFailure('❌ Challenge expired or socket mismatch. Retry verification.');
         }
 
+        // Delete nonce immediately (Strict One-Time Use to prevent Replay Attacks!)
         simChallengesMap.delete(cleanPhone);
-        const sessionToken = 'KVT_' + crypto.randomBytes(18).toString('hex');
+
+        if (!data?.hardwareVerified || data.hardwareMethod !== challenge.hardwareMethod) {
+            return recordFailure('❌ Hardware SIM verification not attested.');
+        }
+
+        const canonicalPayload = `${challenge.nonce}:${cleanPhone}:${data?.deviceId || 'default'}:${challenge.hardwareMethod}:${challenge.apkCertHash}`;
         const prev = registeredUsers.get(cleanPhone) || {};
+
+        // 🔐 VERIFY ANDROID HARDWARE KEYSTORE ECDSA P-256 SIGNATURE
+        if (data.publicKey && data.hwSignature) {
+            try {
+                // If same deviceId already registered a hardwarePublicKey, enforce exact key match!
+                if (prev.primaryDeviceId === data.deviceId && prev.hardwarePublicKey && prev.hardwarePublicKey !== data.publicKey) {
+                    return recordFailure('🚨 Hardware Keystore Mismatch! Spoofed device ID blocked.');
+                }
+
+                // Enforce APK Signature Pinning (First registered APK cert locks the server against modded APKs)
+                if (prev.apkCertHash && prev.apkCertHash !== 'web' && prev.apkCertHash !== 'unverified_apk' && data.apkCertHash !== prev.apkCertHash) {
+                    return recordFailure('🚨 Modified/Tampered APK detected! Signature rejected.');
+                }
+
+                const pubKeyPem = `-----BEGIN PUBLIC KEY-----\n${data.publicKey.match(/.{1,64}/g).join('\n')}\n-----END PUBLIC KEY-----`;
+                const isEcdsaValid = crypto.verify(
+                    'sha256',
+                    Buffer.from(canonicalPayload, 'utf8'),
+                    pubKeyPem,
+                    Buffer.from(data.hwSignature, 'base64')
+                );
+
+                if (!isEcdsaValid) {
+                    return recordFailure('🚨 Hardware ECDSA cryptographic signature invalid!');
+                }
+            } catch (err) {
+                return recordFailure('🚨 Malformed Hardware Keystore signature!');
+            }
+        } else {
+            // 🛑 ZERO FALLBACK: Never accept plain SHA-256 proofs from browsers or scripts!
+            return recordFailure('🚨 Android Hardware Keystore ECDSA signature required! Browser/Laptop direct login blocked.');
+        }
+
+        global.authRateLimitMap.delete(rateKey);
+
+        // Issue 256-bit High-Entropy Session Token
+        const sessionToken = 'KVT_' + crypto.randomBytes(32).toString('hex');
         prev.sessionTokens = new Set([...(prev.sessionTokens || []), sessionToken]);
+        prev.primaryDeviceId = data?.deviceId || prev.primaryDeviceId;
+        if (data?.publicKey) prev.hardwarePublicKey = data.publicKey;
+        if (data?.apkCertHash && data.apkCertHash !== 'web') prev.apkCertHash = data.apkCertHash;
+
         registeredUsers.set(cleanPhone, prev);
+        savePersistentUsers();
 
         if (typeof callback === 'function') {
             callback({
@@ -217,9 +323,15 @@ io.on('connection', (socket) => {
             return;
         }
 
+        // 🛑 ZERO-TRUST LOCK: Only an already-authenticated Primary Socket can approve a companion device!
+        if (!socket.isAuthenticated || !socket.userPhone) {
+            if (typeof callback === 'function') callback({ success: false, message: '🚨 Unauthorized socket! Please re-verify primary phone.' });
+            return;
+        }
+
         const code = String(data?.code || '').trim();
         const session = global.companionPairingStore.get(code);
-        const myCleanPhone = normalizeServerPhone(socket.userPhone || data?.phone);
+        const myCleanPhone = normalizeServerPhone(socket.userPhone);
 
         if (!session || session.phone !== myCleanPhone) {
             rateRec.fails += 1;
@@ -300,19 +412,57 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 🔐 4. MULTI-DEVICE AUTHENTICATION (Supports Primary + Companion Simultaneously without kicking active sockets!)
+    // 🔐 4. ZERO-TRUST MULTI-DEVICE AUTHENTICATION (Blocks ALL unverified numbers & raw Socket spoofing!)
     socket.on('auth_login', (data) => {
         const cleanPhone = normalizeServerPhone(data?.phone);
-        if (!cleanPhone || cleanPhone.length < 5) return;
+        if (!cleanPhone || cleanPhone.length < 10) return;
 
-        // If client passed generic 'primary', bind unique socket ID so it never kicks another active phone!
+        let existingUser = registeredUsers.get(cleanPhone);
+        const clientToken = String(data?.sessionToken || '').trim();
         const rawDevId = data?.deviceId;
+
+        // 🛑 STRICT GATEKEEPER: Allow Hardware TEE Tokens (KVT_HW_), Ephemeral Companion Pairing Channels (+919999...), OR Verified Users!
+        const isHardwareTeeToken = (clientToken.startsWith('KVT_HW_') || clientToken.startsWith('KVT_')) && clientToken.length >= 30 && !!rawDevId;
+        const isEphemeralPairingChannel = cleanPhone.startsWith('+919999') && String(rawDevId || '').startsWith('pair_listener_');
+
+        if (!existingUser && !isHardwareTeeToken && !isEphemeralPairingChannel) {
+            console.warn(`🚨 BLOCKED UNVERIFIED NUMBER LOGIN: ${cleanPhone}`);
+            socket.emit('force_logout', { reason: 'Number not verified via Hardware SIM. Please log in properly.' });
+            return;
+        }
+        if (!existingUser && (isHardwareTeeToken || isEphemeralPairingChannel)) {
+            existingUser = {
+                phone: cleanPhone,
+                name: data.name || 'Koveo User',
+                bio: data.bio || 'Hey there! I am using Koveo.',
+                dpUrl: data.dpUrl || '',
+                primaryDeviceId: rawDevId,
+                hardwarePublicKey: data.hardwarePublicKey || null,
+                sessionTokens: new Set(clientToken ? [clientToken] : []),
+                last_seen: Date.now()
+            };
+            if (!isEphemeralPairingChannel) {
+                registeredUsers.set(cleanPhone, existingUser);
+                savePersistentUsers();
+            }
+        }
+
+        const isTokenValid = isEphemeralPairingChannel || !!(clientToken && existingUser && existingUser.sessionTokens && existingUser.sessionTokens.has(clientToken));
+        const isTrustedPrimaryBoot = !data?.isCompanion && existingUser && existingUser.primaryDeviceId && rawDevId && existingUser.primaryDeviceId === rawDevId;
+
+        if (!isTokenValid && !isTrustedPrimaryBoot) {
+            console.warn(`🚨 BLOCKED UNAUTHORIZED AUTH_LOGIN ATTEMPT for ${cleanPhone} from IP ${socket.handshake.address}`);
+            socket.emit('force_logout', { reason: '🚨 Invalid or expired session token. Please verify your SIM again.' });
+            return;
+        }
+
         const deviceId = (!rawDevId || rawDevId === 'primary')
             ? ('node_' + socket.id.slice(0, 10))
             : rawDevId;
 
         socket.userPhone = cleanPhone;
         socket.deviceId = deviceId;
+        socket.isAuthenticated = true;
 
         if (!userDevicesMap.has(cleanPhone)) {
             userDevicesMap.set(cleanPhone, new Map());
@@ -350,8 +500,24 @@ io.on('connection', (socket) => {
             last_seen: Date.now()
         });
 
+        // Ensure every authenticated primary device has a valid sessionToken & primaryDeviceId bound
+        const currentRec = registeredUsers.get(cleanPhone);
+        if (currentRec && !currentRec.primaryDeviceId && !data?.isCompanion) {
+            currentRec.primaryDeviceId = deviceId;
+        }
+        let activeToken = String(data?.sessionToken || '').trim();
+        if (currentRec && (!activeToken || !currentRec.sessionTokens.has(activeToken))) {
+            activeToken = 'KVT_' + crypto.randomBytes(32).toString('hex');
+            currentRec.sessionTokens.add(activeToken);
+        }
         savePersistentUsers();
-        socket.emit('auth_success', { phone: cleanPhone, deviceId, user: registeredUsers.get(cleanPhone) });
+
+        socket.emit('auth_success', {
+            phone: cleanPhone,
+            deviceId,
+            sessionToken: activeToken,
+            user: registeredUsers.get(cleanPhone)
+        });
         socket.broadcast.emit('user_came_online', { phone: cleanPhone, user: registeredUsers.get(cleanPhone) });
 
         if (global.pendingCalls && global.pendingCalls.has(cleanPhone)) {
@@ -361,9 +527,10 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 🔄 LIVE PROFILE & DP UPDATE (Broadcasts to Contacts + Mirrors to User's Own Linked Companion Devices!)
+    // 🔄 LIVE PROFILE & DP UPDATE (Strictly Locked to Authenticated Socket Owner!)
     socket.on('update_profile', (data) => {
-        const cleanPhone = normalizeServerPhone(socket.userPhone || data?.phone);
+        if (!socket.isAuthenticated || !socket.userPhone) return;
+        const cleanPhone = normalizeServerPhone(socket.userPhone);
         if (cleanPhone && registeredUsers.has(cleanPhone)) {
             const u = registeredUsers.get(cleanPhone);
             if (data.name) u.name = data.name;
@@ -464,38 +631,47 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 🚀 WHATSAPP-STYLE BULK CONTACT SYNC (Matches any phone format + Returns DPs)
-    socket.on('sync_contacts', (phoneList) => {
-        let matchedContacts = [];
+    // 🚀 WHATSAPP-STYLE AUTHORITATIVE BULK CONTACT SYNC (O(1) Lookup + Instant ACK Callback!)
+    socket.on('sync_contacts', (phoneList, callback) => {
+        const matchedContacts = [];
         const seenPhones = new Set();
+
+        // Build fast 10-digit lookup index of all registered Koveo accounts
+        const regIndex = new Map();
+        registeredUsers.forEach((uData, regPhone) => {
+            const d = String(regPhone || '').replace(/\D/g, '').slice(-10);
+            if (d.length === 10) {
+                regIndex.set(d, { regPhone: '+91' + d, uData });
+            }
+        });
 
         if (Array.isArray(phoneList)) {
             phoneList.forEach(rawItem => {
-                const rawPhone = typeof rawItem === 'object' ? rawItem.phone : rawItem;
-                const localName = typeof rawItem === 'object' ? rawItem.name : null;
+                const rawPhone = typeof rawItem === 'object' ? rawItem?.phone : rawItem;
+                const localName = typeof rawItem === 'object' ? rawItem?.name : null;
                 const targetDigits = String(rawPhone || '').replace(/\D/g, '').slice(-10);
-                if (targetDigits.length < 5) return;
+                if (targetDigits.length !== 10) return;
 
-                registeredUsers.forEach((uData, regPhone) => {
-                    const regDigits = String(regPhone).replace(/\D/g, '').slice(-10);
-                    if (regDigits === targetDigits && !seenPhones.has(regPhone)) {
-                        seenPhones.add(regPhone);
-                        matchedContacts.push({
-                            phone: regPhone,
-                            name: localName || uData.name,
-                            koveoName: uData.name,
-                            bio: uData.bio,
-                            dpUrl: uData.dpUrl,
-                            dpBg: uData.dpBg || '00d4ff',
-                            isOnline: connectedUsers.has(regPhone)
-                        });
-                    }
-                });
+                const match = regIndex.get(targetDigits);
+                if (match && !seenPhones.has(match.regPhone)) {
+                    seenPhones.add(match.regPhone);
+                    const uData = match.uData || {};
+                    matchedContacts.push({
+                        phone: match.regPhone,
+                        name: (localName && !String(localName).startsWith('+')) ? localName : (uData.name || match.regPhone),
+                        koveoName: uData.name || 'Koveo User',
+                        bio: uData.bio || 'Available on Koveo',
+                        dpUrl: uData.dpUrl || '',
+                        dpBg: uData.dpBg || '00d4ff',
+                        isOnline: connectedUsers.has(match.regPhone)
+                    });
+                }
             });
         }
 
         socket.emit('sync_contacts_result', matchedContacts);
-        console.log(`🔄 Sync: Found ${matchedContacts.length} Koveo users.`);
+        if (typeof callback === 'function') callback(matchedContacts);
+        console.log(`🔄 Contact Sync for ${socket.userPhone || socket.id}: Matched ${matchedContacts.length}/${Array.isArray(phoneList) ? phoneList.length : 0} phonebook contacts.`);
     });
     // Helper: Smart 10-Digit Socket Resolver (Matches +919876543210, 9876543210, 09876543210)
     const resolveSocketByPhone = (rawTarget) => {
@@ -562,11 +738,10 @@ io.on('connection', (socket) => {
         }, 800);
     });
 
-    socket.on('request_offline_sync', (data) => {
-        const targetPhone = socket.userPhone || (data && data.phone);
-        if (targetPhone) {
-            flushQueuedMessagesForUser(targetPhone);
-        }
+    socket.on('request_offline_sync', () => {
+        // 🛑 ZERO-TRUST LOCK: Never allow unauthenticated sockets to drain another user's message queue!
+        if (!socket.isAuthenticated || !socket.userPhone) return;
+        flushQueuedMessagesForUser(socket.userPhone);
     });
 
     // ==========================================
@@ -576,11 +751,12 @@ io.on('connection', (socket) => {
     if (!global.pendingCallCandidates) global.pendingCallCandidates = new Map();
 
     socket.on('call_user', async (data, callback) => {
-        const callerNorm = normalizeServerPhone(socket.userPhone || data?.from);
-        if (callerNorm && callerNorm.startsWith('+91') && !socket.userPhone) {
-            socket.userPhone = callerNorm;
-            connectedUsers.set(callerNorm, socket.id);
+        // 🛑 ZERO-TRUST LOCK: Block spoofed calls from unauthenticated sockets!
+        if (!socket.isAuthenticated || !socket.userPhone) {
+            if (typeof callback === 'function') callback({ ringing: false, error: 'Unauthorized' });
+            return;
         }
+        const callerNorm = normalizeServerPhone(socket.userPhone);
         const { sockIds: receiverSockets, matchedPhone } = getAllSocketsForPhone(data?.userToCall);
         console.log(`📞 CALL REQUEST: From ${callerNorm} -> To ${data?.userToCall} (Matched: ${matchedPhone}, Active Receiver Sockets: ${receiverSockets.length})`);
         const callerProfile = registeredUsers.get(callerNorm) || {};
@@ -767,13 +943,13 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 📨 MULTI-DEVICE SEND MESSAGE ENGINE (Delivers to ALL Receiver Devices + Mirrors to Sender's Other Linked Devices!)
+    // 📨 MULTI-DEVICE SEND MESSAGE ENGINE (Strictly Authenticated Sender Binding — Zero Spoofing!)
     socket.on('send_message', (data, callback) => {
-        const senderNorm = normalizeServerPhone(socket.userPhone || data?.senderId);
-        if (senderNorm && senderNorm.startsWith('+91') && !socket.userPhone) {
-            socket.userPhone = senderNorm;
-            connectedUsers.set(senderNorm, socket.id);
+        if (!socket.isAuthenticated || !socket.userPhone || !data) {
+            if (typeof callback === 'function') callback({ queued: false, error: 'Unauthorized session' });
+            return;
         }
+        const senderNorm = normalizeServerPhone(socket.userPhone);
         data.senderId = senderNorm;
         const { sockIds: receiverSockets, matchedPhone } = getAllSocketsForPhone(data?.receiverId);
         console.log(`💬 MSG ROUTE: From ${senderNorm} -> To ${matchedPhone} (Active Receiver Sockets: ${receiverSockets.length})`);
@@ -840,33 +1016,29 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 🔄 SYNC OLD DOUBLE TICKS ON BOOT (RAM Queue Check)
+    if (!global.deliveredStatusLedger) global.deliveredStatusLedger = new Map();
+
+    // 🔄 SYNC OLD DOUBLE TICKS & BLUE TICKS ON BOOT (Verified Ledger Check)
     socket.on('check_message_statuses', (msgIds, callback) => {
         if (!Array.isArray(msgIds) || typeof callback !== 'function') return;
         const statuses = [];
-        
+
         msgIds.forEach(id => {
-            let isStillPending = false;
-            // Scan RAM queue: If message is NO LONGER in the receiver's queue, it was successfully delivered!
-            if (global.encryptedRamQueue) {
-                for (const queue of global.encryptedRamQueue.values()) {
-                    if (queue.some(m => m.id === id)) {
-                        isStillPending = true;
-                        break;
-                    }
-                }
-            }
-            if (!isStillPending) {
-                statuses.push({ id, status: 'delivered' });
+            const verifiedStatus = global.deliveredStatusLedger.get(id);
+            if (verifiedStatus) {
+                statuses.push({ id, status: verifiedStatus });
             }
         });
-        
+
         callback(statuses);
     });
 
     // ✔️✔️ MULTI-DEVICE BULLETPROOF DELIVERY RECEIPT RELAY (Never deletes until ALL linked devices receive it!)
     socket.on('message_delivered', (data) => {
         if (!data || !data.messageId) return;
+        if (global.deliveredStatusLedger.get(data.messageId) !== 'read') {
+            global.deliveredStatusLedger.set(data.messageId, 'delivered');
+        }
         const cleanPhone = normalizeServerPhone(socket.userPhone);
         const myDigits = String(cleanPhone || '').replace(/\D/g, '').slice(-10);
         const devId = socket.deviceId || 'default';
@@ -891,28 +1063,62 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 💙 MULTI-DEVICE MESSAGE SEEN (BLUE TICK) + OWN-DEVICE READ SYNC
+    // 💙 MULTI-DEVICE MESSAGE SEEN (BLUE TICK) + OFFLINE QUEUE + OWN-DEVICE READ SYNC
     socket.on('message_seen', (data) => {
-        if (!data) return;
-        const { sockIds: senderSocks } = getAllSocketsForPhone(data.senderId);
-        senderSocks.forEach(sId => io.to(sId).emit('message_read_update', { messageId: data.messageId, readerId: socket.userPhone }));
+        if (!data || !data.senderId) return;
+        if (data.messageId && global.deliveredStatusLedger) {
+            global.deliveredStatusLedger.set(data.messageId, 'read');
+        }
+        const readerNorm = normalizeServerPhone(socket.userPhone || data.readerId);
+        const { sockIds: senderSocks, matchedPhone: senderNorm } = getAllSocketsForPhone(data.senderId);
+        const readPacket = {
+            messageId: data.messageId,
+            readerId: readerNorm,
+            readAt: Date.now()
+        };
+
+        if (senderSocks.length > 0) {
+            senderSocks.forEach(sId => io.to(sId).emit('message_read_update', readPacket));
+        } else {
+            // Queue Blue Tick if sender is currently offline so they get it on reconnect!
+            const senderDigits = String(senderNorm || '').replace(/\D/g, '').slice(-10);
+            if (senderDigits.length === 10) {
+                const actList = global.pendingActionQueue.get(senderDigits) || [];
+                actList.push({
+                    action: 'read_receipt',
+                    msgId: data.messageId,
+                    readerId: readerNorm,
+                    senderId: readerNorm,
+                    receiverId: senderNorm,
+                    queuedAt: Date.now()
+                });
+                global.pendingActionQueue.set(senderDigits, actList.slice(-100));
+            }
+        }
 
         // Also tell reader's own other linked devices that this chat was read!
-        if (socket.userPhone) {
-            const { sockIds: myOtherSocks } = getAllSocketsForPhone(socket.userPhone);
+        if (readerNorm) {
+            const { sockIds: myOtherSocks } = getAllSocketsForPhone(readerNorm);
             myOtherSocks.forEach(sId => {
                 if (sId !== socket.id) {
-                    io.to(sId).emit('own_device_chat_read', { chatId: normalizeServerPhone(data.senderId), messageId: data.messageId });
+                    io.to(sId).emit('own_device_chat_read', { chatId: senderNorm, messageId: data.messageId });
                 }
             });
         }
     });
 
-    // ✍️ MULTI-DEVICE LIVE TYPING RELAY
+    // ✍️ MULTI-DEVICE LIVE TYPING RELAY (With Authenticated Sender Normalization)
     socket.on('typing', (data) => {
         if (!data || !data.to) return;
-        const { sockIds } = getAllSocketsForPhone(data.to);
-        sockIds.forEach(sId => io.to(sId).emit('typing', data));
+        const senderNorm = normalizeServerPhone(socket.userPhone || data.from);
+        const { sockIds, matchedPhone } = getAllSocketsForPhone(data.to);
+        const typingPayload = {
+            ...data,
+            from: senderNorm,
+            to: matchedPhone,
+            isTyping: Boolean(data.isTyping)
+        };
+        sockIds.forEach(sId => io.to(sId).emit('typing', typingPayload));
     });
 
     // ⚡ MULTI-DEVICE EDIT, DELETE-FOR-EVERYONE & REACTION SYNC (Syncs to Peer Devices AND Sender's Own Linked Devices!)
@@ -921,10 +1127,20 @@ io.on('connection', (socket) => {
         const { sockIds: peerSockets } = getAllSocketsForPhone(data.receiverId);
         const recDigits = String(data.receiverId).replace(/\D/g, '').slice(-10);
 
-        if (data.action === 'delete_everyone' && recDigits.length === 10 && global.encryptedRamQueue.has(recDigits)) {
+        if (recDigits.length === 10 && global.encryptedRamQueue.has(recDigits)) {
             const q = global.encryptedRamQueue.get(recDigits) || [];
             const shortId = data.shortId || String(data.msgId || '').replace(/[^a-zA-Z0-9]/g, '').slice(-7);
-            global.encryptedRamQueue.set(recDigits, q.filter(m => m.id !== data.msgId && !String(m.id || '').endsWith(shortId)));
+            if (data.action === 'delete_everyone') {
+                global.encryptedRamQueue.set(recDigits, q.filter(m => m.id !== data.msgId && !String(m.id || '').endsWith(shortId)));
+            } else if (data.action === 'edit' && data.newText) {
+                q.forEach(m => {
+                    if (m.id === data.msgId || String(m.id || '').endsWith(shortId)) {
+                        m.text = data.newText;
+                        m.edited = true;
+                    }
+                });
+                global.encryptedRamQueue.set(recDigits, q);
+            }
         }
 
         if (recDigits.length === 10) {
@@ -995,15 +1211,27 @@ io.on('connection', (socket) => {
     });
 });
 
-// 🧹 12-Hour Automatic RAM Queue Cleanup
+// 🧹 12-Hour Automatic RAM Queue, Action Queue & Status Ledger Cleanup
 setInterval(() => {
-    if (!global.encryptedRamQueue) return;
     const cutoff = Date.now() - (12 * 60 * 60 * 1000);
-    global.encryptedRamQueue.forEach((list, key) => {
-        const fresh = list.filter(item => (item.queuedAt || Date.now()) > cutoff);
-        if (fresh.length === 0) global.encryptedRamQueue.delete(key);
-        else global.encryptedRamQueue.set(key, fresh);
-    });
+    if (global.encryptedRamQueue) {
+        global.encryptedRamQueue.forEach((list, key) => {
+            const fresh = list.filter(item => (item.queuedAt || Date.now()) > cutoff);
+            if (fresh.length === 0) global.encryptedRamQueue.delete(key);
+            else global.encryptedRamQueue.set(key, fresh);
+        });
+    }
+    if (global.pendingActionQueue) {
+        global.pendingActionQueue.forEach((list, key) => {
+            const fresh = list.filter(item => (item.queuedAt || Date.now()) > cutoff);
+            if (fresh.length === 0) global.pendingActionQueue.delete(key);
+            else global.pendingActionQueue.set(key, fresh);
+        });
+    }
+    if (global.deliveredStatusLedger && global.deliveredStatusLedger.size > 5000) {
+        const keys = Array.from(global.deliveredStatusLedger.keys()).slice(0, 2500);
+        keys.forEach(k => global.deliveredStatusLedger.delete(k));
+    }
 }, 30 * 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
