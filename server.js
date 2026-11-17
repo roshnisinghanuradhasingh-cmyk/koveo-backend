@@ -1168,6 +1168,194 @@ io.on('connection', (socket) => {
         console.log(`🚩 Safety Report from ${socket.userPhone} against ${data?.targetId}: ${data?.reason}`);
     });
 
+    // ==========================================
+    // 🟢 24-HOUR STATUS (SIGNALS) ENGINE & MEDIA RELAY
+    // ==========================================
+    if (!global.koveoStatusesMap) global.koveoStatusesMap = new Map(); // phone -> Array of status metadata
+    if (!global.koveoStatusMediaMap) global.koveoStatusMediaMap = new Map(); // mediaId -> Base64 string
+
+    const STATUS_TTL_MS = 24 * 60 * 60 * 1000; // Strict 24 Hours
+
+    const pruneExpiredServerStatuses = () => {
+        const now = Date.now();
+        global.koveoStatusesMap.forEach((list, phoneKey) => {
+            const valid = list.filter(st => {
+                const expired = (now - (st.createdAt || st.receivedAt || now)) >= STATUS_TTL_MS || (st.expiresAt && now >= st.expiresAt);
+                if (expired && st.mediaId) {
+                    global.koveoStatusMediaMap.delete(st.mediaId);
+                }
+                return !expired;
+            });
+            if (valid.length === 0) global.koveoStatusesMap.delete(phoneKey);
+            else global.koveoStatusesMap.set(phoneKey, valid);
+        });
+    };
+
+    // 1. Publish New Status (Text, Image, or Video)
+    socket.on('publish_status', (statusData, callback) => {
+        if (!socket.isAuthenticated || !socket.userPhone || !statusData) {
+            if (typeof callback === 'function') callback({ success: false });
+            return;
+        }
+        pruneExpiredServerStatuses();
+
+        const ownerPhone = normalizeServerPhone(socket.userPhone);
+        const ownerProfile = registeredUsers.get(ownerPhone) || {};
+        const now = Date.now();
+        const statusId = statusData.id || ('st_' + now + '_' + crypto.randomBytes(3).toString('hex'));
+        const mediaId = statusData.mediaId || null;
+
+        // Store heavy media in RAM map if provided, and strip from broadcast metadata
+        if (mediaId && statusData.mediaData) {
+            global.koveoStatusMediaMap.set(mediaId, statusData.mediaData);
+        }
+
+        const cleanStatus = {
+            id: statusId,
+            mediaId: mediaId,
+            ownerPhone: ownerPhone,
+            name: statusData.name || ownerProfile.name || ownerPhone,
+            dpUrl: statusData.dpUrl || ownerProfile.dpUrl || '',
+            bg: statusData.bg || '#00d4ff',
+            fontFamily: statusData.fontFamily || 'Inter, sans-serif',
+            content: statusData.mediaType === 'text' ? String(statusData.content || '') : '',
+            caption: String(statusData.caption || ''),
+            mediaType: statusData.mediaType || 'text',
+            music: statusData.music || null,
+            time: statusData.time || 'Just now',
+            createdAt: statusData.createdAt || now,
+            receivedAt: now,
+            expiresAt: (statusData.createdAt || now) + STATUS_TTL_MS,
+            views: [],
+            likes: []
+        };
+
+        const existingList = global.koveoStatusesMap.get(ownerPhone) || [];
+        existingList.push(cleanStatus);
+        global.koveoStatusesMap.set(ownerPhone, existingList.slice(-30)); // Max 30 active segments per user
+
+        // Broadcast lightweight status metadata to all connected users
+        socket.broadcast.emit('receive_status_update', cleanStatus);
+
+        // Mirror to owner's companion devices
+        const { sockIds: mySocks } = getAllSocketsForPhone(ownerPhone);
+        mySocks.forEach(sId => {
+            if (sId !== socket.id) io.to(sId).emit('own_status_synced', cleanStatus);
+        });
+
+        if (typeof callback === 'function') callback({ success: true, status: cleanStatus });
+    });
+
+    // 2. Fetch Heavy Status Media On-Demand (Lazy Load for Photo/Video Status)
+    socket.on('fetch_status_media', (mediaId, callback) => {
+        if (typeof callback !== 'function') return;
+        const data = mediaId ? global.koveoStatusMediaMap.get(mediaId) : null;
+        callback({ success: !!data, mediaId, data: data || null });
+    });
+
+    // 3. Sync All Active (<24h) Statuses on Login / Refresh
+    socket.on('request_active_statuses', (callback) => {
+        pruneExpiredServerStatuses();
+        const allActive = {};
+        global.koveoStatusesMap.forEach((list, phoneKey) => {
+            if (list && list.length > 0) {
+                allActive[phoneKey] = list;
+            }
+        });
+        socket.emit('active_statuses_bundle', allActive);
+        if (typeof callback === 'function') callback(allActive);
+    });
+
+    // 4. Mark Status Viewed & Notify Owner with Viewer Info
+    socket.on('mark_status_viewed', (data) => {
+        if (!data || !data.statusId || !data.ownerPhone) return;
+        const viewerPhone = normalizeServerPhone(socket.userPhone || data.viewerPhone);
+        const ownerPhone = normalizeServerPhone(data.ownerPhone);
+        if (!viewerPhone || viewerPhone === ownerPhone) return;
+
+        const viewerProfile = registeredUsers.get(viewerPhone) || {};
+        const list = global.koveoStatusesMap.get(ownerPhone);
+        if (!list) return;
+
+        const targetSt = list.find(s => s.id === data.statusId);
+        if (targetSt) {
+            if (!Array.isArray(targetSt.views)) targetSt.views = [];
+            if (!targetSt.views.some(v => v.phone === viewerPhone)) {
+                const viewEntry = {
+                    phone: viewerPhone,
+                    name: data.viewerName || viewerProfile.name || viewerPhone,
+                    dpUrl: data.viewerDp || viewerProfile.dpUrl || '',
+                    viewedAt: Date.now(),
+                    time: data.time || 'Just now',
+                    liked: false
+                };
+                targetSt.views.push(viewEntry);
+                const { sockIds: ownerSocks } = getAllSocketsForPhone(ownerPhone);
+                ownerSocks.forEach(sId => io.to(sId).emit('status_view_update', {
+                    statusId: targetSt.id,
+                    ownerPhone: ownerPhone,
+                    viewer: viewEntry,
+                    totalViews: targetSt.views.length
+                }));
+            }
+        }
+    });
+
+    // 5. Like Status (Heart Reaction Sync to Owner's Viewer List)
+    socket.on('like_status', (data) => {
+        if (!data || !data.statusId || !data.ownerPhone) return;
+        const likerPhone = normalizeServerPhone(socket.userPhone || data.likerPhone);
+        const ownerPhone = normalizeServerPhone(data.ownerPhone);
+        if (!likerPhone || likerPhone === ownerPhone) return;
+
+        const likerProfile = registeredUsers.get(likerPhone) || {};
+        const list = global.koveoStatusesMap.get(ownerPhone);
+        if (!list) return;
+
+        const targetSt = list.find(s => s.id === data.statusId);
+        if (targetSt) {
+            if (!Array.isArray(targetSt.views)) targetSt.views = [];
+            let vEntry = targetSt.views.find(v => v.phone === likerPhone);
+            if (!vEntry) {
+                vEntry = {
+                    phone: likerPhone,
+                    name: data.likerName || likerProfile.name || likerPhone,
+                    dpUrl: data.likerDp || likerProfile.dpUrl || '',
+                    viewedAt: Date.now(),
+                    time: 'Just now',
+                    liked: true
+                };
+                targetSt.views.push(vEntry);
+            } else {
+                vEntry.liked = true;
+            }
+            const { sockIds: ownerSocks } = getAllSocketsForPhone(ownerPhone);
+            ownerSocks.forEach(sId => io.to(sId).emit('status_view_update', {
+                statusId: targetSt.id,
+                ownerPhone: ownerPhone,
+                viewer: vEntry,
+                totalViews: targetSt.views.length
+            }));
+        }
+    });
+
+    // 6. Delete Own Status Segment Before 24h
+    socket.on('delete_status', (data, callback) => {
+        if (!socket.isAuthenticated || !socket.userPhone || !data?.statusId) return;
+        const ownerPhone = normalizeServerPhone(socket.userPhone);
+        const list = global.koveoStatusesMap.get(ownerPhone) || [];
+        const target = list.find(s => s.id === data.statusId);
+        if (target && target.mediaId) {
+            global.koveoStatusMediaMap.delete(target.mediaId);
+        }
+        const updated = list.filter(s => s.id !== data.statusId);
+        if (updated.length === 0) global.koveoStatusesMap.delete(ownerPhone);
+        else global.koveoStatusesMap.set(ownerPhone, updated);
+
+        io.emit('status_deleted', { ownerPhone, statusId: data.statusId });
+        if (typeof callback === 'function') callback({ success: true });
+    });
+
     // 🔴 MULTI-DEVICE DISCONNECT LOGIC & GHOST CALL CANCELLATION
     socket.on('disconnect', () => {
         const userId = socket.userPhone;
@@ -1233,6 +1421,29 @@ setInterval(() => {
         keys.forEach(k => global.deliveredStatusLedger.delete(k));
     }
 }, 30 * 60 * 1000);
+
+// 🧹 60-Second Strict 24-Hour Status Auto-Expiry Sweep
+setInterval(() => {
+    if (!global.koveoStatusesMap) return;
+    const now = Date.now();
+    const ttl = 24 * 60 * 60 * 1000;
+    global.koveoStatusesMap.forEach((list, phoneKey) => {
+        const remaining = [];
+        list.forEach(st => {
+            const isExpired = (now - (st.createdAt || st.receivedAt || now)) >= ttl || (st.expiresAt && now >= st.expiresAt);
+            if (isExpired) {
+                if (st.mediaId && global.koveoStatusMediaMap) {
+                    global.koveoStatusMediaMap.delete(st.mediaId);
+                }
+                io.emit('status_deleted', { ownerPhone: phoneKey, statusId: st.id, expired: true });
+            } else {
+                remaining.push(st);
+            }
+        });
+        if (remaining.length === 0) global.koveoStatusesMap.delete(phoneKey);
+        else global.koveoStatusesMap.set(phoneKey, remaining);
+    });
+}, 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => { 
