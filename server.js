@@ -3,13 +3,32 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const admin = require('firebase-admin');
 
-// 🚀 INITIALIZE FIREBASE ADMIN
-const serviceAccount = require('./koveo-firebase-adminsdk.json');
-admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-});
+// 🚀 SAFE INITIALIZE FIREBASE ADMIN (Never crashes server if JSON or module is missing!)
+let admin = null;
+let isFirebaseReady = false;
+try {
+    admin = require('firebase-admin');
+    const fsCheck = require('fs');
+    const pathCheck = require('path');
+    const keyPath = pathCheck.join(__dirname, 'koveo-firebase-adminsdk.json');
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+        admin.initializeApp({
+            credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT))
+        });
+        isFirebaseReady = true;
+    } else if (fsCheck.existsSync(keyPath)) {
+        const serviceAccount = require(keyPath);
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+        });
+        isFirebaseReady = true;
+    } else {
+        console.warn('⚠️ koveo-firebase-adminsdk.json not found — running Socket-Only Mode (No Crash).');
+    }
+} catch (err) {
+    console.warn('⚠️ Firebase Admin skipped:', err.message);
+}
 
 const app = express();
 app.use(cors());
